@@ -4,6 +4,9 @@
 #include <ctype.h>
 #include <stdlib.h>
 #include <unistd.h>
+#include <sys/socket.h>
+#include <signal.h>
+#include <netinet/in.h>
 
 /**
  * Maximum length of hostname (fully qualified)
@@ -34,6 +37,13 @@ struct proc_stats {
     unsigned long softirq;
     unsigned long steal;
 };
+
+/**
+ * Per-module global variable for detecting SIGINT for smooth closing of the program
+ *
+ * Source: https://stackoverflow.com/a/4217052
+ */
+static volatile bool keep_running = true;
 
 /**
  * Skips a line (or the rest of it) in the file
@@ -82,14 +92,14 @@ int load_proc_stats(struct proc_stats *stats) {
     //      user    nice   system  idle      iowait irq   softirq  steal  guest  guest_nice
     // cpu  74608   2520   24433   1117073   6176   4054  0        0      0      0
     if ((proc_stats_file = fopen("/proc/stat", "r")) == NULL) {
-        fprintf(stderr, "Cannot open file /proc/stat");
+        fprintf(stderr, "Cannot open file /proc/stat\n");
         return 1;
     }
 
     // Skip text start of the line ("cpu")
     fgets(buffer, sizeof(buffer), proc_stats_file);
     if (strcmp(buffer, "cpu") != 0) {
-        fprintf(stderr, "Bad line read from /proc/stat. The line doesn't start with: cpu");
+        fprintf(stderr, "Bad line read from /proc/stat. The line doesn't start with: cpu\n");
         return 1;
     }
 
@@ -107,7 +117,7 @@ int load_proc_stats(struct proc_stats *stats) {
 }
 
 /**
- * Finds and returns hostname of the computer running this program
+ * Finds and returns hostname of the computer keep_running this program
  *
  * @param hostname Pointer to place where to save found hostname to
  * @return 0 => success, 1 => error
@@ -119,7 +129,7 @@ int get_hostname(char *hostname) {
     // Get output of `hostname` command
     hostname_file = popen("/bin/hostname -f", "r");
     if (hostname_file == NULL) {
-        fprintf(stderr, "Cannot execute command `/bin/hostname -f`");
+        fprintf(stderr, "Cannot execute command `/bin/hostname -f`\n");
         return 1;
     }
 
@@ -235,20 +245,137 @@ int get_cpu_load(void) {
 }
 
 /**
+ * Sets up the handle for SIGINT
+ *
+ * @param signal Signal number (not used)
+ */
+void handleSigInt(int signal) {
+    // Not used here...
+    (void) signal;
+
+    // Set a flag to end this program's main cycle
+    keep_running = false;
+}
+
+/**
+ * Creates and inits the welcome socket for TCP/IP communication
+ *
+ * @param port Port to bind socket to
+ * @return Welcome socket file descriptor or -1 if error occurred
+ */
+int make_welcome_socket(unsigned port) {
+    int welcome_socket;
+    struct sockaddr_in6 server_addr;
+
+    if ((welcome_socket = socket(PF_INET6, SOCK_STREAM, IPPROTO_TCP)) == -1) {
+        fprintf(stderr, "Cannot create socket\n");
+        return -1;
+    }
+
+    // Source: https://stackoverflow.com/a/1618259
+    if (setsockopt(welcome_socket, IPPROTO_IPV6, IPV6_V6ONLY, &(int){0}, sizeof(int)) == -1) {
+        fprintf(stderr, "Cannot setup socket\n");
+        close(welcome_socket);
+        return -1;
+    }
+    if (setsockopt(welcome_socket, SOL_SOCKET, SO_REUSEADDR, &(int){1}, sizeof(int)) == -1) {
+        fprintf(stderr, "Cannot setup socket\n");
+        close(welcome_socket);
+        return -1;
+    }
+    if (setsockopt(welcome_socket, SOL_SOCKET, SO_REUSEPORT, &(int){1}, sizeof(int)) == -1) {
+        fprintf(stderr, "Cannot setup socket\n");
+        close(welcome_socket);
+        return -1;
+    }
+
+    // Assign an address and the port to the socket
+    server_addr.sin6_family = AF_INET6;
+    server_addr.sin6_addr = in6addr_any;
+    server_addr.sin6_port = htons(port);
+
+    if (bind(welcome_socket, (struct sockaddr *) &server_addr, sizeof(server_addr)) == -1) {
+        fprintf(stderr, "Cannot bind socket to port %d\n", port);
+        close(welcome_socket);
+        return -1;
+    }
+
+    return welcome_socket;
+}
+
+/**
  * Init (main) function of the program
  *
  * @param argc Number of CLI arguments
  * @param argv CLI arguments as array of "strings"
  * @return Program's exit code
+ *
+ * Inspired by the 2nd presentation from the subject IPK on FIT BUT
  */
 int main(int argc, char *argv[]) {
-    (void)argc;
-    (void)argv;
+    unsigned port;
+    int welcome_socket;
+
+    int conn_socket;
+    struct sockaddr_in6 client_addr;
+    unsigned client_addr_len = sizeof(client_addr);
+
+    char buffer[256] = "";
+    int read_state;
 
     char hostname[HOSTNAME_LENGTH + 1] = "";
     char cpu_info[CPU_INFO_LENGTH + 1] = "";
     int cpu_load;
 
+    // Load port from CLI (required argument)
+    if (argc < 2) {
+        fprintf(stderr, "You need to specify a port. For example: %s 12345\n", argv[0]);
+        return 1;
+    }
+
+    port = strtoul(argv[1], NULL, 10);
+
+    // Setup handling SIGINT for smooth stop of the program
+    signal(SIGINT, handleSigInt);
+
+    // Setup socket
+    if ((welcome_socket = make_welcome_socket(port)) == -1) {
+        return 1;
+    }
+
+    // Start listening
+    if (listen(welcome_socket, 1) == -1) {
+        fprintf(stderr, "Cannot start socket listening\n");
+        close(welcome_socket);
+        return 1;
+    }
+
+    while (keep_running) {
+        conn_socket = accept(welcome_socket, (struct sockaddr *) &client_addr, &client_addr_len);
+        if (conn_socket > 0) {
+            // Connection request to already established socket --> data arrived
+            while ((read_state = (int)read(conn_socket, buffer, sizeof(buffer) - 1)) > 0) {
+                buffer[strlen(buffer) - 1] = '\0';
+                printf("Output: %s\n", buffer);
+            }
+
+            // TODO: send response
+
+            if (close(conn_socket) == -1) {
+                fprintf(stderr, "Cannot close connection socket\n");
+                close(welcome_socket);
+                return 1;
+            }
+
+            if (read_state == -1) {
+                fprintf(stderr, "Cannot read data from connection socket\n");
+                close(welcome_socket);
+                return 1;
+            }
+        }
+    }
+
+    // Run the HTTP server
     if (get_hostname(hostname) != 0) {
         return 1;
     }
@@ -263,5 +390,6 @@ int main(int argc, char *argv[]) {
     printf("CPU info: %s\n", cpu_info);
     printf("CPU load: %d%%\n", cpu_load);
 
+    close(welcome_socket);
     return 0;
 }
