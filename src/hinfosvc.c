@@ -7,6 +7,8 @@
 #include <sys/socket.h>
 #include <signal.h>
 #include <netinet/in.h>
+#include <fcntl.h>
+#include <sys/signalfd.h>
 
 /**
  * Maximum length of hostname (fully qualified)
@@ -37,13 +39,6 @@ struct proc_stats {
     unsigned long softirq;
     unsigned long steal;
 };
-
-/**
- * Per-module global variable for detecting SIGINT for smooth closing of the program
- *
- * Source: https://stackoverflow.com/a/4217052
- */
-static volatile bool keep_running = true;
 
 /**
  * Skips a line (or the rest of it) in the file
@@ -245,19 +240,6 @@ int get_cpu_load(void) {
 }
 
 /**
- * Sets up the handle for SIGINT
- *
- * @param signal Signal number (not used)
- */
-void handleSigInt(int signal) {
-    // Not used here...
-    (void) signal;
-
-    // Set a flag to end this program's main cycle
-    keep_running = false;
-}
-
-/**
  * Creates and inits the welcome socket for TCP/IP communication
  *
  * @param port Port to bind socket to
@@ -266,6 +248,7 @@ void handleSigInt(int signal) {
 int make_welcome_socket(unsigned port) {
     int welcome_socket;
     struct sockaddr_in6 server_addr;
+    int socket_flags;
 
     if ((welcome_socket = socket(PF_INET6, SOCK_STREAM, IPPROTO_TCP)) == -1) {
         fprintf(stderr, "Cannot create socket\n");
@@ -289,6 +272,10 @@ int make_welcome_socket(unsigned port) {
         return -1;
     }
 
+    // Activate non-blocking mode
+    socket_flags = fcntl(welcome_socket, F_GETFL, 0);
+    fcntl(welcome_socket, F_SETFL, socket_flags | O_NONBLOCK);
+
     // Assign an address and the port to the socket
     server_addr.sin6_family = AF_INET6;
     server_addr.sin6_addr = in6addr_any;
@@ -304,6 +291,27 @@ int make_welcome_socket(unsigned port) {
 }
 
 /**
+ * Makes and inits SIGINT file descriptor
+ *
+ * @return SIGINT file descriptor or -1 if error occurred
+ */
+int make_int_sig_fd() {
+    sigset_t signal_set;
+
+    // Prepare mask
+    sigemptyset(&signal_set);
+    sigaddset(&signal_set, SIGINT);
+
+    // Block standard signal handling
+    if (sigprocmask(SIG_BLOCK, &signal_set, NULL) == -1) {
+        fprintf(stderr, "Cannot apply signal mask\n");
+        return -1;
+    }
+
+    return signalfd(-1, &signal_set, 0);
+}
+
+/**
  * Init (main) function of the program
  *
  * @param argc Number of CLI arguments
@@ -313,13 +321,16 @@ int make_welcome_socket(unsigned port) {
  * Inspired by the 2nd presentation from the subject IPK on FIT BUT
  */
 int main(int argc, char *argv[]) {
+    bool keep_running = true;
     unsigned port;
-    int welcome_socket;
 
+    int int_signal;
     int conn_socket;
+    int welcome_socket;
+    fd_set read_socks, write_socks;
+
     struct sockaddr_in6 client_addr;
     unsigned client_addr_len = sizeof(client_addr);
-
     char buffer[256] = "";
     int read_state;
 
@@ -336,7 +347,10 @@ int main(int argc, char *argv[]) {
     port = strtoul(argv[1], NULL, 10);
 
     // Setup handling SIGINT for smooth stop of the program
-    signal(SIGINT, handleSigInt);
+    if ((int_signal = make_int_sig_fd()) == -1) {
+        fprintf(stderr, "Cannot create SIGINT file descriptor\n");
+        return 1;
+    }
 
     // Setup socket
     if ((welcome_socket = make_welcome_socket(port)) == -1) {
@@ -351,27 +365,52 @@ int main(int argc, char *argv[]) {
     }
 
     while (keep_running) {
+        FD_ZERO(&read_socks);
+        FD_ZERO(&write_socks);
+
+        FD_SET(welcome_socket, &read_socks);
+        FD_SET(int_signal, &read_socks);
+        FD_SET(welcome_socket, &write_socks);
+
+        select(FD_SETSIZE, &read_socks, &write_socks, NULL, NULL);
+
+        // Handling SIGINT --> stop the server
+        if (FD_ISSET(int_signal, &read_socks)) {
+            close(welcome_socket);
+            keep_running = false;
+            continue;
+        }
+
+        if (!FD_ISSET(welcome_socket, &write_socks) && !FD_ISSET(welcome_socket, &read_socks)) {
+            continue;
+        }
+
+        // Create connection for data transfer throw new socket
         conn_socket = accept(welcome_socket, (struct sockaddr *) &client_addr, &client_addr_len);
-        if (conn_socket > 0) {
-            // Connection request to already established socket --> data arrived
-            while ((read_state = (int)read(conn_socket, buffer, sizeof(buffer) - 1)) > 0) {
-                buffer[strlen(buffer) - 1] = '\0';
-                printf("Output: %s\n", buffer);
-            }
+        if (conn_socket == -1) {
+            fprintf(stderr, "Cannot create connection socket for data transfer\n");
+            close(welcome_socket);
+            return 1;
+        }
 
-            // TODO: send response
+        // We have connection --> we can read data from client
+        while ((read_state = (int)read(conn_socket, buffer, sizeof(buffer) - 1)) > 0) {
+            buffer[strlen(buffer) - 1] = '\0';
+            printf("%s\n", buffer);
+        }
 
-            if (close(conn_socket) == -1) {
-                fprintf(stderr, "Cannot close connection socket\n");
-                close(welcome_socket);
-                return 1;
-            }
+        // TODO: send response
 
-            if (read_state == -1) {
-                fprintf(stderr, "Cannot read data from connection socket\n");
-                close(welcome_socket);
-                return 1;
-            }
+        if (close(conn_socket) == -1) {
+            fprintf(stderr, "Cannot close connection socket\n");
+            close(welcome_socket);
+            return 1;
+        }
+
+        if (read_state == -1) {
+            fprintf(stderr, "Cannot read data from connection socket\n");
+            close(welcome_socket);
+            return 1;
         }
     }
 
@@ -390,6 +429,5 @@ int main(int argc, char *argv[]) {
     printf("CPU info: %s\n", cpu_info);
     printf("CPU load: %d%%\n", cpu_load);
 
-    close(welcome_socket);
     return 0;
 }
