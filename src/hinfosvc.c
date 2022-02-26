@@ -9,6 +9,7 @@
 #include <netinet/in.h>
 #include <fcntl.h>
 #include <sys/signalfd.h>
+#include <time.h>
 
 /**
  * Maximum length of hostname (fully qualified)
@@ -25,6 +26,36 @@
  * computer and school servers + some reserve
  */
 #define CPU_INFO_LENGTH 100
+/**
+ * Maximum length of the first line of the HTTP request.
+ * It is based on supported requests from project assignment
+ */
+#define MAX_MSG_LINE_LEN 30
+/**
+ * Maximum length of response message (header + body).
+ * It is based on items' limits and the header skeleton
+ */
+#define OUTPUT_BUFFER_LEN 512
+/**
+ * Maximum length of HTTP' state message (based on the length of the longest HTTP state name)
+ */
+#define HTTP_STATE_MSG_LEN 26
+/**
+ * Maximum length of supported HTTP method => strlen("GET")
+ */
+#define HTTP_METHOD_LEN 3
+/**
+ * Maximum length of HTTP version => strlen("HTTP/1.1")
+ */
+#define HTTP_VERSION_LEN 8
+/**
+ * Maximum length of supported HTTP URI
+ */
+#define HTTP_URI_LEN (MAX_MSG_LINE_LEN - HTTP_METHOD_LEN - HTTP_VERSION_LEN)
+/**
+ * Maximum length of datetime formatted for HTTP headers => strlen("Tue, 22 Feb 2022 21:22:19 GMT")
+ */
+#define HTTP_DATETIME_LEN 29
 
 /**
  * Structure of records in /proc/stat
@@ -236,7 +267,7 @@ int get_cpu_load(void) {
     idle_delta = curr_idle - prev_idle;
 
     // * 100 --> result is in %
-    return (int)(((total_delta - idle_delta) * 100) / total_delta);
+    return (int) (((total_delta - idle_delta) * 100) / total_delta);
 }
 
 /**
@@ -256,17 +287,17 @@ int make_welcome_socket(unsigned port) {
     }
 
     // Source: https://stackoverflow.com/a/1618259
-    if (setsockopt(welcome_socket, IPPROTO_IPV6, IPV6_V6ONLY, &(int){0}, sizeof(int)) == -1) {
+    if (setsockopt(welcome_socket, IPPROTO_IPV6, IPV6_V6ONLY, &(int) {0}, sizeof(int)) == -1) {
         fprintf(stderr, "Cannot setup socket\n");
         close(welcome_socket);
         return -1;
     }
-    if (setsockopt(welcome_socket, SOL_SOCKET, SO_REUSEADDR, &(int){1}, sizeof(int)) == -1) {
+    if (setsockopt(welcome_socket, SOL_SOCKET, SO_REUSEADDR, &(int) {1}, sizeof(int)) == -1) {
         fprintf(stderr, "Cannot setup socket\n");
         close(welcome_socket);
         return -1;
     }
-    if (setsockopt(welcome_socket, SOL_SOCKET, SO_REUSEPORT, &(int){1}, sizeof(int)) == -1) {
+    if (setsockopt(welcome_socket, SOL_SOCKET, SO_REUSEPORT, &(int) {1}, sizeof(int)) == -1) {
         fprintf(stderr, "Cannot setup socket\n");
         close(welcome_socket);
         return -1;
@@ -312,6 +343,149 @@ int make_int_sig_fd() {
 }
 
 /**
+ * Constructs and returns current datetime in HTTP's header format
+ *
+ * @param formatted_datetime Pointer to the place where to save (return) the datetime
+ */
+void get_http_datetime(char *formatted_datetime) {
+    time_t epoch_time;
+    struct tm *gmt;
+
+    time(&epoch_time);
+    gmt = gmtime(&epoch_time);
+
+    strftime(formatted_datetime, HTTP_DATETIME_LEN, "%a, %d %b %Y %H:%M:%S ", gmt);
+}
+
+/**
+ * Goes throw buffer and increments its index until whitespaces are read
+ *
+ * @param buffer Buffer to work with
+ * @param index Index of the buffer (pointer to it)
+ */
+void skip_whitespaces(const char *buffer, unsigned *index) {
+    while (isspace(buffer[(*index)++])) {
+        ; // Just skipping whitespace characters
+    }
+
+    // The last tries char wasn't whitespace, it needs to be recovered
+    (*index)--;
+}
+
+/**
+ * Parses HTTP request and retrieves parsed data
+ *
+ * @param http_request Buffer with the first line of the HTTP request
+ * @param method Pointer to the place where to save parsed HTTP method
+ * @param uri Pointer to the place where to save parsed HTTP URI
+ * @param version Pointer to the place where to save parsed HTTP version
+ * @return Error code (equals to HTTP error code number --> 200 => success, etc.)
+ */
+unsigned parse_http_request(const char *http_request, char *method, char *uri, char *version) {
+    unsigned local_ix;
+    unsigned req_ix = 0;
+
+    // HTTP method
+    for (local_ix = 0; local_ix < HTTP_METHOD_LEN; local_ix++) {
+        method[local_ix] = http_request[req_ix++];
+    }
+    method[HTTP_METHOD_LEN] = '\0';
+
+    if (strcmp(method, "GET") != 0) {
+        // Forbidden method
+        return 405;
+    }
+
+    skip_whitespaces(http_request, &req_ix);
+
+    // HTTP URI
+    for (local_ix = 0; local_ix < HTTP_URI_LEN; local_ix++) {
+        if (!isspace(http_request[req_ix])) {
+            uri[local_ix] = http_request[req_ix++];
+        } else {
+            // Whitespace char mean the end of the URI item
+            break;
+        }
+    }
+    memset(&uri[local_ix], '\0', HTTP_URI_LEN - strlen(uri));
+
+    if (!isspace(http_request[req_ix])) {
+        // HTTP URI is longer than maximum
+        return 414;
+    }
+
+    skip_whitespaces(http_request, &req_ix);
+
+    // HTTP version
+    for (local_ix = 0; local_ix < HTTP_VERSION_LEN; local_ix++) {
+        version[local_ix] = http_request[req_ix++];
+    }
+
+    if (strcmp(version, "HTTP/1.1") != 0) {
+        // Unsupported HTTP version
+        return 505;
+    }
+
+    return 200;
+}
+
+/**
+ * Processed single HTTP request and prepares a response for it
+ *
+ * @param http_request Buffer with the first line of the HTTP request to process
+ * @param http_response Buffer where to save complete HTTP response
+ */
+void process_http_request(const char *http_request, char *http_response) {
+    char method[HTTP_METHOD_LEN + 1] = "";
+    char uri[HTTP_URI_LEN + 1] = "";
+    char version[HTTP_VERSION_LEN + 1] = "";
+
+    unsigned status_code;
+    char status_msg[HTTP_STATE_MSG_LEN + 1] = "OK";
+    char datetime[HTTP_DATETIME_LEN + 1];
+    char data[HOSTNAME_LENGTH + 1] = "";
+    char response_body[HOSTNAME_LENGTH + 1] = ""; // Hostname is the longest possible body type
+
+    // Parse HTTP request
+    status_code = parse_http_request(http_request, method, uri, version);
+
+    // Process parsed data
+    if (status_code == 405) {
+        sprintf(status_msg, "Method Not Allowed");
+    } else if (status_code == 505) {
+        sprintf(status_msg, "HTTP Version Not Supported");
+    } else if (status_code == 414) {
+        sprintf(status_msg, "URI Too Long");
+    } else {
+        if (strcmp(uri, "/hostname") == 0) {
+            get_hostname(data);
+            sprintf(response_body, "%s\r\n", data);
+        } else if (strcmp(uri, "/cpu-name") == 0) {
+            get_cpu_info(data);
+            sprintf(response_body, "%s\r\n", data);
+        } else if (strcmp(uri, "/load") == 0) {
+            sprintf(response_body, "%d%%\r\n", get_cpu_load());
+        } else {
+            status_code = 404;
+            sprintf(status_msg, "Not Found");
+        }
+    }
+
+    // Construct response
+    get_http_datetime(datetime);
+
+    sprintf(http_response,
+            "HTTP/1.1 %d %s\r\n"
+            "Connection: close\r\n"
+            "Date: %s\r\n"
+            "Server: hinfosvc/1.0\r\n"
+            "Content-Length: %d\r\n"
+            "Content-Type: text/plain\r\n"
+            "\r\n"
+            "%s", status_code, status_msg, datetime, (int)strlen(response_body), response_body);
+}
+
+/**
  * Init (main) function of the program
  *
  * @param argc Number of CLI arguments
@@ -331,7 +505,8 @@ int main(int argc, char *argv[]) {
 
     struct sockaddr_in6 client_addr;
     unsigned client_addr_len = sizeof(client_addr);
-    char buffer[256] = "";
+    char request_buffer[MAX_MSG_LINE_LEN + 1] = "";
+    char response_buffer[OUTPUT_BUFFER_LEN + 1] = "";
     int read_state;
 
     char hostname[HOSTNAME_LENGTH + 1] = "";
@@ -394,12 +569,28 @@ int main(int argc, char *argv[]) {
         }
 
         // We have connection --> we can read data from client
-        while ((read_state = (int)read(conn_socket, buffer, sizeof(buffer) - 1)) > 0) {
-            buffer[strlen(buffer) - 1] = '\0';
-            printf("%s\n", buffer);
+//        while ((read_state = (int)read(conn_socket, request_buffer, sizeof(request_buffer) - 1)) > 0) {
+//            request_buffer[strlen(request_buffer) - 1] = '\0';
+//            printf("%s\n", request_buffer);
+//        }
+
+        // Get HTTP request
+        if ((int) read(conn_socket, request_buffer, sizeof(request_buffer) - 1) == -1) {
+            fprintf(stderr, "Cannot read data from connection socket\n");
+            close(conn_socket);
+            close(welcome_socket);
+            return 1;
         }
 
-        // TODO: send response
+        process_http_request(request_buffer, response_buffer);
+
+        // Send HTTP response
+        if (write(conn_socket, response_buffer, strlen(response_buffer)) == -1) {
+            fprintf(stderr, "Cannot write data to connection socket\n");
+            close(conn_socket);
+            close(welcome_socket);
+            return 1;
+        }
 
         if (close(conn_socket) == -1) {
             fprintf(stderr, "Cannot close connection socket\n");
@@ -407,11 +598,11 @@ int main(int argc, char *argv[]) {
             return 1;
         }
 
-        if (read_state == -1) {
-            fprintf(stderr, "Cannot read data from connection socket\n");
-            close(welcome_socket);
-            return 1;
-        }
+//        if (read_state == -1) {
+//            fprintf(stderr, "Cannot read data from connection socket\n");
+//            close(welcome_socket);
+//            return 1;
+//        }
     }
 
     // Run the HTTP server
