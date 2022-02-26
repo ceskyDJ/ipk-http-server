@@ -9,4 +9,4 @@ set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_COMPILER gcc)
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -g -pedantic -Wall -Wextra -fsanitize=address")
 
-add_executable(http_server src/hinfosvc.c src/hinfosvc.h)
+add_executable(http_server src/hinfosvc.c src/http-processing.c src/http-processing.h src/system-info.c src/system-info.h)

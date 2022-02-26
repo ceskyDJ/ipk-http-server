@@ -1,7 +1,12 @@
 # IDE's and debug files
 .idea/
 build/
-cmake-build-debug
+cmake-build-debug/
+
+# Temporary files
+src/*.o
+src/dep.list
+src/hinfosvc
 
 # Final archive
 xsmahe01.tar.gz
