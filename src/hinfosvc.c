@@ -507,11 +507,6 @@ int main(int argc, char *argv[]) {
     unsigned client_addr_len = sizeof(client_addr);
     char request_buffer[MAX_MSG_LINE_LEN + 1] = "";
     char response_buffer[OUTPUT_BUFFER_LEN + 1] = "";
-    int read_state;
-
-    char hostname[HOSTNAME_LENGTH + 1] = "";
-    char cpu_info[CPU_INFO_LENGTH + 1] = "";
-    int cpu_load;
 
     // Load port from CLI (required argument)
     if (argc < 2) {
@@ -520,6 +515,10 @@ int main(int argc, char *argv[]) {
     }
 
     port = strtoul(argv[1], NULL, 10);
+    if (port < 1025 || port > 65535) {
+        fprintf(stderr, "Port must be a number 1025-65535 (0-1024 are protected by OS)\n");
+        return 1;
+    }
 
     // Setup handling SIGINT for smooth stop of the program
     if ((int_signal = make_int_sig_fd()) == -1) {
@@ -540,6 +539,7 @@ int main(int argc, char *argv[]) {
     }
 
     while (keep_running) {
+        // Prepare file descriptor watchers
         FD_ZERO(&read_socks);
         FD_ZERO(&write_socks);
 
@@ -547,6 +547,7 @@ int main(int argc, char *argv[]) {
         FD_SET(int_signal, &read_socks);
         FD_SET(welcome_socket, &write_socks);
 
+        // Passive wait for new connection or SIGINT
         select(FD_SETSIZE, &read_socks, &write_socks, NULL, NULL);
 
         // Handling SIGINT --> stop the server
@@ -567,12 +568,6 @@ int main(int argc, char *argv[]) {
             close(welcome_socket);
             return 1;
         }
-
-        // We have connection --> we can read data from client
-//        while ((read_state = (int)read(conn_socket, request_buffer, sizeof(request_buffer) - 1)) > 0) {
-//            request_buffer[strlen(request_buffer) - 1] = '\0';
-//            printf("%s\n", request_buffer);
-//        }
 
         // Get HTTP request
         if ((int) read(conn_socket, request_buffer, sizeof(request_buffer) - 1) == -1) {
@@ -597,28 +592,7 @@ int main(int argc, char *argv[]) {
             close(welcome_socket);
             return 1;
         }
-
-//        if (read_state == -1) {
-//            fprintf(stderr, "Cannot read data from connection socket\n");
-//            close(welcome_socket);
-//            return 1;
-//        }
     }
-
-    // Run the HTTP server
-    if (get_hostname(hostname) != 0) {
-        return 1;
-    }
-    if (get_cpu_info(cpu_info) != 0) {
-        return 1;
-    }
-    if ((cpu_load = get_cpu_load()) < 0) {
-        return 1;
-    }
-
-    printf("Hostname: %s\n", hostname);
-    printf("CPU info: %s\n", cpu_info);
-    printf("CPU load: %d%%\n", cpu_load);
 
     return 0;
 }
