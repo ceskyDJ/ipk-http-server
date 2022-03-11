@@ -117,7 +117,6 @@ int main(int argc, char *argv[]) {
 
     struct sockaddr_in6 client_addr;
     unsigned client_addr_len = sizeof(client_addr);
-    char request_buffer[MAX_MSG_LINE_LEN + 1] = "";
     char response_buffer[OUTPUT_BUFFER_LEN + 1] = "";
 
     // Load port from CLI (required argument)
@@ -181,15 +180,13 @@ int main(int argc, char *argv[]) {
             return 1;
         }
 
-        // Get HTTP request
-        if ((int) read(conn_socket, request_buffer, sizeof(request_buffer) - 1) == -1) {
-            fprintf(stderr, "Cannot read data from connection socket\n");
+        // Process HTTP request
+        if (process_http_request(conn_socket, response_buffer) != 0) {
+            fprintf(stderr, "Cannot process HTTP request\n");
             close(conn_socket);
             close(welcome_socket);
             return 1;
         }
-
-        process_http_request(request_buffer, response_buffer);
 
         // Send HTTP response
         if (write(conn_socket, response_buffer, strlen(response_buffer)) == -1) {

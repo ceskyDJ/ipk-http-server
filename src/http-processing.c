@@ -4,13 +4,29 @@
  *
  * @author Michal Šmahel (xsmahe01)
  */
-#include <bits/types/time_t.h>
 #include <time.h>
 #include <ctype.h>
 #include <string.h>
 #include <stdio.h>
+#include <unistd.h>
 #include "http-processing.h"
 #include "system-info.h"
+
+/**
+ * States of the FSM for loading HTTP request
+ */
+enum loading_state {
+    // Processing of the first row
+    FIRST_ROW_S,
+    // Reading of the header name
+    HEADER_S,
+    // Whitespace characters between header name and its value
+    SPACE_S,
+    // Reading of the header value
+    VALUE_S,
+    // The end of the HTTP head (\r) - just for a check
+    END_S,
+};
 
 /**
  * Constructs and returns current datetime in HTTP's header format
@@ -40,6 +56,80 @@ void skip_whitespaces(const char *buffer, unsigned *index) {
 
     // The last tries char wasn't whitespace, it needs to be recovered
     (*index)--;
+}
+
+/**
+ * Loads an HTTP request from the opened socket
+ *
+ * @param conn_socket Open socket identifier
+ * @param request_buffer Buffer where the first line will be written to
+ * @return 0 => success, 1 => socket error, 2 => bad HTTP format
+ */
+int load_http_request(int conn_socket, char *request_buffer) {
+    enum loading_state state = FIRST_ROW_S;
+    int read_bytes;
+    int buffer_index = 0;
+    char c;
+
+    while ((read_bytes = (int)read(conn_socket, &c, 1)) == 1) {
+        switch (state) {
+            case FIRST_ROW_S:
+                if (c == '\n') {
+                    state = HEADER_S;
+                } else {
+                    if (buffer_index < MAX_MSG_LINE_LEN) {
+                        request_buffer[buffer_index++] = c;
+                    } else {
+                        // Maximum size of the first line has been reached, longer lines can't be processed
+                        return 2;
+                    }
+                    state = FIRST_ROW_S;
+                }
+                break;
+            case HEADER_S:
+                if ((isalnum(c) || c == '-') && c != ':') {
+                    state = HEADER_S;
+                } else if (c == ':') {
+                    state = SPACE_S;
+                } else if (c == '\r') {
+                    // At the end of the HTTP head must be [\r]\n ([...] is selector)
+                    state = END_S;
+                } else {
+                    // Header must contain only alphanumeric chars and -
+                    return 2;
+                }
+                break;
+            case SPACE_S:
+                if (isspace(c)) {
+                    state = SPACE_S;
+                } else {
+                    state = VALUE_S;
+                }
+                break;
+            case VALUE_S:
+                if (c != '\n') {
+                    state = VALUE_S;
+                } else {
+                    state = HEADER_S;
+                }
+                break;
+            case END_S:
+                if (c == '\n') {
+                    return 0;
+                } else {
+                    // At the end of the HTTP head must be \r[\n] ([...] is selector)
+                    return 2;
+                }
+        }
+    }
+
+    // System error while reading socket
+    if (read_bytes == -1) {
+        return 1;
+    }
+
+    // read_bytes == 0 --> End of the HTTP request but the HTTP head wasn't correctly ended
+    return 2;
 }
 
 /**
@@ -103,32 +193,51 @@ unsigned parse_http_request(const char *http_request, char *method, char *uri, c
 }
 
 /**
- * Processed single HTTP request and prepares a response for it
+ * Processes single HTTP request and prepares a response for it
  *
- * @param http_request Buffer with the first line of the HTTP request to process
+ * @param conn_socket Identifier of the socket used for loading HTTP request
  * @param http_response Buffer where to save complete HTTP response
+ * @return 0 => success, 1 => error
  */
-void process_http_request(const char *http_request, char *http_response) {
+int process_http_request(int conn_socket, char *http_response) {
+    char request_buffer[MAX_MSG_LINE_LEN + 1] = "";
+
     char method[HTTP_METHOD_LEN + 1] = "";
     char uri[HTTP_URI_LEN + 1] = "";
     char version[HTTP_VERSION_LEN + 1] = "";
 
+    int loading_result;
     unsigned status_code;
     char status_msg[HTTP_STATE_MSG_LEN + 1] = "OK";
     char datetime[HTTP_DATETIME_LEN + 1];
     char data[HOSTNAME_LENGTH + 1] = "";
     char response_body[HOSTNAME_LENGTH + 1 + 2] = ""; // Hostname is the longest possible body type, \r\n --> +2
 
+    // Load HTTP request data
+    loading_result = load_http_request(conn_socket, request_buffer);
+
+    // Loading ended with system error, we can't continue with processing
+    if (loading_result == 1) {
+        return 1;
+    }
+
     // Parse HTTP request
-    status_code = parse_http_request(http_request, method, uri, version);
+    if (loading_result == 0) {
+        status_code = parse_http_request(request_buffer, method, uri, version);
+    } else {
+        // Loading detected invalid HTTP request structure
+        status_code = 400;
+    }
 
     // Process parsed data
-    if (status_code == 405) {
+    if (status_code == 400) {
+        sprintf(status_msg, "Bad Request");
+    } else if (status_code == 405) {
         sprintf(status_msg, "Method Not Allowed");
-    } else if (status_code == 505) {
-        sprintf(status_msg, "HTTP Version Not Supported");
     } else if (status_code == 414) {
         sprintf(status_msg, "URI Too Long");
+    } else if (status_code == 505) {
+        sprintf(status_msg, "HTTP Version Not Supported");
     } else {
         // status_code == 200
         if (strcmp(uri, "/hostname") == 0) {
@@ -157,4 +266,6 @@ void process_http_request(const char *http_request, char *http_response) {
             "Content-Type: text/plain\r\n"
             "\r\n"
             "%s", status_code, status_msg, datetime, (int)strlen(response_body), response_body);
+
+    return 0;
 }

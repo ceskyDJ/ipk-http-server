@@ -34,11 +34,12 @@
 #define HTTP_DATETIME_LEN 29
 
 /**
- * Processed single HTTP request and prepares a response for it
+ * Processes single HTTP request and prepares a response for it
  *
- * @param http_request Buffer with the first line of the HTTP request to process
+ * @param conn_socket Identifier of the socket used for loading HTTP request
  * @param http_response Buffer where to save complete HTTP response
+ * @return 0 => success, 1 => error
  */
-void process_http_request(const char *http_request, char *http_response);
+int process_http_request(int conn_socket, char *http_response);
 
 #endif //HINFOSVC_PROCESSING_H
